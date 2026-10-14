@@ -299,7 +299,7 @@ function NanConnect({ connected, onChange, account }: { connected: boolean; onCh
       )}
       <small className="eg-field__hint">
         {msg ??
-          'Igual que «nan auth login --email»: NaN te manda un enlace de un solo uso. No lo abras en el navegador (se gastaría): cópialo y pégalo aquí. La sesión se guarda en el Administrador de credenciales de Windows y da los mismos datos que tu dashboard.'}
+          'Igual que «nan auth login --email»: NaN te manda un enlace de un solo uso. No lo abras en el navegador (se gastaría): cópialo y pégalo aquí. La sesión se guarda en el almacén de credenciales del sistema y da los mismos datos que tu dashboard.'}
       </small>
     </div>
   );
@@ -1967,7 +1967,7 @@ export function Settings() {
               <Section title="Cuándo avisar">
                 <Rows>
                   <Toggle label="Activar avisos" checked={cfg.alerts.enabled} onChange={(v) => set('alerts', { enabled: v })} />
-                  <Toggle label="Notificación de Windows" hint="Además del efecto en pantalla." checked={cfg.alerts.native} onChange={(v) => set('alerts', { native: v })} />
+                  <Toggle label="Notificación del sistema" hint="Además del efecto en pantalla." checked={cfg.alerts.native} onChange={(v) => set('alerts', { native: v })} />
                 </Rows>
                 <div className="q-moment">
                   <h3>1 · Al superar el límite</h3>
