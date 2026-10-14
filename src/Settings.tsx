@@ -1509,14 +1509,14 @@ export function Settings() {
                 disabled={autostartState.busy || autostartState.confirmed === null}
                 onChange={(e) => setAutostartDraft(e.target.checked)}
               />{' '}
-              Arrancar con Windows
+              Arrancar al iniciar sesión
             </label>
           </header>
 
           {autostartState.error && (
             <div className="eg-notice eg-notice--warning eg-notice--sm" role="alert">
               <span className="eg-notice__text">
-                {autostartState.confirmed === null ? 'No se pudo leer «Arrancar con Windows»: ' : ''}
+                {autostartState.confirmed === null ? 'No se pudo leer «Arrancar al iniciar sesión»: ' : ''}
                 {autostartState.error}
               </span>
               {autostartState.confirmed === null && (

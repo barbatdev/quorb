@@ -1,5 +1,5 @@
 /**
- * Controlador del check «Arrancar con Windows». La base confirmada la da
+ * Controlador del check «Arrancar al iniciar sesión». La base confirmada la da
  * siempre una lectura real del sistema operativo: aplicar no basta, hay que
  * leer de vuelta y comprobar que coincide antes de dar el valor por bueno.
  */
