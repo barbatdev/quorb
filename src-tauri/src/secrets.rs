@@ -126,4 +126,19 @@ mod tests {
         assert!(!is_known("otra_cosa@openrouter:a1b2c3"));
         assert!(!is_known("openrouter_api_key@../../x"));
     }
+
+    /// Smoke test real del almacén de secretos en macOS (Keychain): escribe,
+    /// lee y borra una clave propia de prueba. Queda acotado a macOS porque la
+    /// CI corre en Windows y no debe tocar el Credential Manager; el backend
+    /// `apple-native` se ejercita igual que en la app (mismo servicio).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_set_get_delete_roundtrip() {
+        let key = scoped(OPENROUTER_API_KEY, "openrouter:test-keychain");
+        assert!(get(&key).is_none(), "la clave de prueba debería no existir");
+        set(&key, "valor-de-prueba").expect("set en Keychain");
+        assert_eq!(get(&key).as_deref(), Some("valor-de-prueba"));
+        set(&key, "").expect("borrado con set vacío");
+        assert!(get(&key).is_none(), "la clave debería quedar eliminada");
+    }
 }
