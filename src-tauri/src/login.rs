@@ -221,9 +221,10 @@ fn spawn_terminal(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) ->
 
 #[cfg(target_os = "macos")]
 fn spawn_terminal(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) -> Result<(), String> {
+    let script = macos_terminal_script(command, env, extra_dir)?;
     let mut cmd = std::process::Command::new("osascript");
     cmd.arg("-e")
-        .arg(macos_terminal_script(command, env, extra_dir))
+        .arg(script)
         .current_dir(dirs::home_dir().unwrap_or_else(|| ".".into()))
         .spawn()
         .map(|_| ())
@@ -237,11 +238,19 @@ fn spawn_terminal(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) ->
 /// como parte del texto del script. El texto completo se incrusta entre comillas
 /// dobles de AppleScript con el escaping correspondiente.
 ///
+/// El comando de login es configurable por el usuario: los caracteres de
+/// control se rechazan (un `\n` rompe el quoting de `do script` y puede
+/// ejecutar líneas fuera de la intención), y el resto queda inerte por el
+/// doble escaping shell+AppleScript.
+///
 /// Los helpers puros de quoting también compilan en los builds de test de
 /// Windows y Linux: su contracto de escaping es parte de la superficie probada
 /// del port y las plataformas sin Terminal deben validarlos igual.
 #[cfg(any(test, target_os = "macos"))]
-fn macos_terminal_script(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) -> String {
+fn macos_terminal_script(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) -> Result<String, String> {
+    if command.chars().any(char::is_control) {
+        return Err("El comando de login contiene caracteres de control (revísalo en Ajustes)".into());
+    }
     let mut sh = String::new();
     if let Some(dir) = &extra_dir {
         sh.push_str(&format!("export PATH={}:\"$PATH\"; ", sh_quote(&dir.to_string_lossy())));
@@ -251,7 +260,7 @@ fn macos_terminal_script(command: &str, env: SessionEnv, extra_dir: Option<PathB
     }
     sh.push_str(command);
     sh.push_str("; exec $SHELL");
-    format!("tell application \"Terminal\" to do script \"{}\"", apple_script_quote(&sh))
+    Ok(format!("tell application \"Terminal\" to do script \"{}\"", apple_script_quote(&sh)))
 }
 
 /// Escapa un texto para insertarlo entre comillas simples de shell.
@@ -431,7 +440,7 @@ mod tests {
 
     #[test]
     fn macos_script_runs_the_command_and_then_the_users_shell() {
-        let script = macos_terminal_script("codex login", None, None);
+        let script = macos_terminal_script("codex login", None, None).unwrap();
         assert!(script.starts_with("tell application \"Terminal\" to do script \""));
         assert!(script.contains("codex login"));
         assert!(script.contains("exec $SHELL"));
@@ -440,7 +449,7 @@ mod tests {
     #[test]
     fn macos_script_exports_the_session_env_with_spaces_and_non_ascii() {
         let dir = PathBuf::from("/Users/ju/ Mi Carpeta Ñ");
-        let script = macos_terminal_script("claude login", Some(("CODEX_HOME", dir.clone())), None);
+        let script = macos_terminal_script("claude login", Some(("CODEX_HOME", dir.clone())), None).unwrap();
         assert!(script.contains("export CODEX_HOME='/Users/ju/ Mi Carpeta Ñ'"));
         assert!(script.contains("codex") || script.contains("claude"));
     }
@@ -448,9 +457,29 @@ mod tests {
     #[test]
     fn macos_script_prepends_the_extra_dir_to_the_path() {
         let extra = PathBuf::from("/opt/mis herramientas/bin");
-        let script = macos_terminal_script("codex login", None, Some(extra));
+        let script = macos_terminal_script("codex login", None, Some(extra)).unwrap();
         // las comillas de "$PATH" quedan escapadas en la capa AppleScript
         assert!(script.contains("export PATH='/opt/mis herramientas/bin':\\\"$PATH\\\""));
+    }
+
+    /// Entrada hostil pero imprimible (comillas, backticks, $(…), punto y coma):
+    /// no se rechaza, se deja inerte por el doble escaping y no rompe el script.
+    #[test]
+    fn macos_script_keeps_hostile_printable_input_quoted_and_on_one_line() {
+        let script = macos_terminal_script("echo 'co\"de'; rm -rf $(x) `y`; ls", None, None).unwrap();
+        assert!(!script.contains('\n'), "el payload no debe contener saltos de línea");
+        assert!(script.contains("\\\""), "las comillas dobles quedan escapadas en AppleScript");
+    }
+
+    /// Caracteres de control (newlines, tabs, etc.) en el comando configurable:
+    /// se rechazan antes de construir el script. Un `\n` dentro del argumento de
+    /// `do script` rompe el quoting de AppleScript y puede ejecutar líneas
+    /// adicionales fuera de la intención del usuario.
+    #[test]
+    fn macos_script_rejects_control_characters_in_the_command() {
+        assert!(macos_terminal_script("codex login\nrm -rf ~", None, None).is_err());
+        assert!(macos_terminal_script("codex\tlogin", None, None).is_err());
+        assert!(macos_terminal_script("\u{1b}[31mrojo", None, None).is_err());
     }
 
     #[cfg(target_os = "macos")]
