@@ -96,6 +96,44 @@ struct AppState {
     history: history::History,
 }
 
+/// Resultado de un patch atómico. `native_error` describe un efecto nativo que
+/// falló **después** de persistir la config: estado parcial recuperable, nunca
+/// un éxito total ni un rollback prometido.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ConfigPatchOutcome {
+    config: AppConfig,
+    native_error: Option<String>,
+}
+
+/// ¿El patch pide re-aplicar el efecto nativo de «siempre encima»? Decide por
+/// **presencia del campo**, no por cambio de valor: un reintento debe re-aplicar
+/// aunque la config ya tuviera el mismo valor (la persistencia pudo pasar y el
+/// efecto nativo fallar).
+fn patch_touches_always_on_top(patch: &config::WidgetPatch) -> bool {
+    patch.always_on_top.is_some()
+}
+
+/// Aplica «siempre encima» al widget y al detalle. Devuelve el **primer** error
+/// legible en vez de descartarlo: el fallo nativo es visible y recuperable.
+fn apply_always_on_top(app: &AppHandle, value: bool) -> Option<String> {
+    let mut error = None;
+    for label in [WIDGET, DETAIL] {
+        if let Some(w) = app.get_webview_window(label) {
+            if let Err(e) = w.set_always_on_top(value) {
+                if error.is_none() {
+                    error = Some(always_on_top_error(&e.to_string()));
+                }
+            }
+        }
+    }
+    error
+}
+
+fn always_on_top_error(detail: &str) -> String {
+    format!("No se pudo aplicar «siempre encima»: {detail}")
+}
+
 // ───────────────────────── comandos ─────────────────────────
 
 #[tauri::command]
@@ -130,22 +168,23 @@ fn save_config(app: AppHandle, state: State<'_, AppState>, config: AppConfig) ->
     if old_shortcuts != config.shortcuts {
         apply_shortcuts(&app, &config.shortcuts);
     }
-    for label in [WIDGET, DETAIL] {
-        if let Some(w) = app.get_webview_window(label) {
-            let _ = w.set_always_on_top(config.always_on_top);
-        }
-    }
+    // Contrato legacy de `save_config`: mantiene el efecto nativo de siempre encima.
+    // El resultado del patch vivo (`patch_config`) es el que reporta el fallo.
+    let _ = apply_always_on_top(&app, config.always_on_top);
     let _ = app.emit("config-changed", &config);
     Ok(config)
 }
 
 /// Merge atómico de los campos del widget sobre la config actual: nunca toca
 /// cuentas ni secretos, así un snapshot obsoleto no puede borrar una cuenta.
+/// Devuelve la config persistida junto al posible fallo del efecto nativo.
 #[tauri::command]
-fn patch_config(app: AppHandle, state: State<'_, AppState>, patch: config::WidgetPatch) -> Result<AppConfig, String> {
+fn patch_config(app: AppHandle, state: State<'_, AppState>, patch: config::WidgetPatch) -> Result<ConfigPatchOutcome, String> {
+    let apply_top = patch_touches_always_on_top(&patch);
     let (_old, config) = update_config(&state, |current| current.apply_widget_patch(patch))?;
+    let native_error = if apply_top { apply_always_on_top(&app, config.always_on_top) } else { None };
     let _ = app.emit("config-changed", &config);
-    Ok(config)
+    Ok(ConfigPatchOutcome { config, native_error })
 }
 
 #[tauri::command]
@@ -697,5 +736,23 @@ mod tests {
         // OpenRouter no usa sesión de CLI: ni con ficheros en la carpeta hay presencia.
         std::fs::write(dir.join("auth.json"), b"{}").unwrap();
         assert!(!account_session_file_found(&cfg, "openrouter:w1", &home));
+    }
+
+    #[test]
+    fn patch_touches_always_on_top_by_presence_not_change() {
+        // Mismo valor que la base: el reintento debe re-aplicar el efecto igual.
+        let same: config::WidgetPatch = serde_json::from_str(r#"{"alwaysOnTop":true}"#).unwrap();
+        assert!(patch_touches_always_on_top(&same));
+        assert!(patch_touches_always_on_top(&same));
+        // Un patch que no menciona el campo no re-aplica nada.
+        let other: config::WidgetPatch = serde_json::from_str(r#"{"dockEdge":"left"}"#).unwrap();
+        assert!(!patch_touches_always_on_top(&other));
+    }
+
+    #[test]
+    fn always_on_top_error_is_visible() {
+        let msg = always_on_top_error("acceso denegado");
+        assert!(msg.contains("siempre encima"));
+        assert!(msg.contains("acceso denegado"));
     }
 }
