@@ -15,17 +15,59 @@ use serde_json::Value;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// Respaldo de macOS: Claude Code guarda la sesión OAuth en el Keychain
+/// (servicio «Claude Code-credentials»), no en ~/.claude/.credentials.json —
+/// ese archivo es el layout de Linux/WSL. La primera lectura desde la app
+/// puede mostrar el diálogo de permiso de Keychain («Permitir siempre»). Devuelve
+/// None si no hay entrada, el usuario niega el acceso o el secreto no parsea.
+#[cfg(target_os = "macos")]
+fn keychain_fallback() -> Option<Credentials> {
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_keychain_secret(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_fallback() -> Option<Credentials> {
+    None
+}
+
+/// Parser puro del secreto devuelto por `security … -w`: JSON con la misma
+/// estructura que .credentials.json. Puro para poder probarlo sin Keychain.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_keychain_secret(raw: &str) -> Option<Credentials> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok().and_then(|v| Credentials::parse(&v).ok())
+}
+
 pub async fn fetch(cfg: &SubscriptionConfig, who: Who<'_>, http: &reqwest::Client) -> UsageReport {
     let report = who.report("Claude", Kind::Subscription);
 
     let candidates = vec![home().join(".claude").join(".credentials.json")];
-    let path = match resolve_path(cfg.credentials_path.as_deref(), &candidates) {
-        Ok(p) => p,
-        Err(e) => return report.fail(Status::NeedsLogin, format!("{e}. Inicia sesión en Claude Code.")),
-    };
-    let creds = match read_json(&path).and_then(|v| Credentials::parse(&v)) {
-        Ok(c) => c,
-        Err(e) => return report.fail(Status::Error, e),
+    let creds = match resolve_path(cfg.credentials_path.as_deref(), &candidates) {
+        Ok(p) => match read_json(&p).and_then(|v| Credentials::parse(&v)) {
+            Ok(c) => c,
+            Err(e) => return report.fail(Status::Error, e),
+        },
+        // El archivo no existe: en macOS Claude Code guarda la sesión OAuth en
+        // el Keychain, no en ~/.claude. Se intenta el Keychain antes de fallar.
+        Err(e) => match keychain_fallback() {
+            Some(c) => c,
+            None => {
+                return report.fail(
+                    Status::NeedsLogin,
+                    format!("{e}. Inicia sesión en Claude Code."),
+                )
+            }
+        },
     };
 
     let mut report = report;
@@ -178,5 +220,17 @@ mod tests {
         assert_eq!(m[0].percent, Some(37.0));
         assert_eq!(m[2].resets_at, None);
         assert_eq!(m[0].window_seconds, Some(5 * 3600));
+    }
+
+    /// El secreto del Keychain (`security … -w`) usa la misma estructura JSON
+    /// que .credentials.json; salida vacía o basura → None (sin panic).
+    #[test]
+    fn parses_keychain_secret_and_rejects_garbage() {
+        let secret = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":"2030-01-01T00:00:00Z","scopes":[]}}"#;
+        let c = parse_keychain_secret(secret).expect("secreto válido");
+        assert_eq!(c.access_token, "tok");
+        assert!(parse_keychain_secret("").is_none());
+        assert!(parse_keychain_secret("no es json").is_none());
+        assert!(parse_keychain_secret("{\"otra\":1}").is_none());
     }
 }
