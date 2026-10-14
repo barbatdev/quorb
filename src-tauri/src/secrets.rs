@@ -131,11 +131,26 @@ mod tests {
     /// lee y borra una clave propia de prueba. Queda acotado a macOS porque la
     /// CI corre en Windows y no debe tocar el Credential Manager; el backend
     /// `apple-native` se ejercita igual que en la app (mismo servicio).
+    ///
+    /// Clave única por corrida (pid + nanos): un residuo de una corrida
+    /// interrumpida no bloquea la siguiente. El guard de `Drop` borra la clave
+    /// aunque un assert falle a mitad del test.
     #[cfg(target_os = "macos")]
     #[test]
     fn keychain_set_get_delete_roundtrip() {
-        let key = scoped(OPENROUTER_API_KEY, "openrouter:test-keychain");
-        assert!(get(&key).is_none(), "la clave de prueba debería no existir");
+        struct CleanupGuard(String);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                let _ = set(&self.0, "");
+            }
+        }
+        let key = scoped(
+            OPENROUTER_API_KEY,
+            &format!("openrouter:kc-smoke-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()),
+        );
+        assert!(crate::config::is_account_id(key.split_once('@').unwrap().1), "la clave de prueba debe pasar la validación de cuentas");
+        assert!(get(&key).is_none(), "la clave única de prueba debería no existir");
+        let _guard = CleanupGuard(key.clone());
         set(&key, "valor-de-prueba").expect("set en Keychain");
         assert_eq!(get(&key).as_deref(), Some("valor-de-prueba"));
         set(&key, "").expect("borrado con set vacío");

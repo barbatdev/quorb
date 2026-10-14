@@ -15,26 +15,118 @@ use serde_json::Value;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// Presupuesto duro de la lectura del Keychain: el diálogo de autorización
+/// puede quedar abierto indefinidamente y no debe colgar el refresco conjunto.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resultado de consultar el Keychain de macOS por la sesión de Claude Code.
+#[derive(Debug, PartialEq)]
+enum KeychainOutcome {
+    /// Sesión válida encontrada y parseada.
+    Session(Credentials),
+    /// No hay entrada, el usuario negó el acceso o el secreto no parsea.
+    NoSession,
+    /// La autorización no se completó dentro del presupuesto: estado accionable.
+    TimedOut,
+}
+
 /// Respaldo de macOS: Claude Code guarda la sesión OAuth en el Keychain
 /// (servicio «Claude Code-credentials»), no en ~/.claude/.credentials.json —
 /// ese archivo es el layout de Linux/WSL. La primera lectura desde la app
-/// puede mostrar el diálogo de permiso de Keychain («Permitir siempre»). Devuelve
-/// None si no hay entrada, el usuario niega el acceso o el secreto no parsea.
+/// puede mostrar el diálogo de permiso de Keychain («Permitir siempre»).
+///
+/// Solo aplica a la sesión principal sin ruta explícita: para cuentas
+/// adicionales (o con `credentials_path` configurado) el secreto global del
+/// Keychain pertenece a la principal y mezclarlo cambiaría la etiqueta bajo
+/// la que se reporta el consumo. La ejecución corre fuera del executor
+/// asíncrono y acotada por `KEYCHAIN_TIMEOUT` con kill del proceso.
 #[cfg(target_os = "macos")]
-fn keychain_fallback() -> Option<Credentials> {
-    let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+async fn keychain_fallback() -> KeychainOutcome {
+    let timeout = KEYCHAIN_TIMEOUT;
+    match tokio::task::spawn_blocking(move || keychain_sync(timeout)).await {
+        Ok(outcome) => outcome,
+        Err(_) => KeychainOutcome::NoSession,
     }
-    parse_keychain_secret(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_fallback() -> Option<Credentials> {
-    None
+async fn keychain_fallback() -> KeychainOutcome {
+    KeychainOutcome::NoSession
+}
+
+/// ¿Corresponde intentar el respaldo de Keychain? Solo la sesión principal
+/// sin `credentials_path` explícito: las cuentas adicionales y las rutas
+/// configuradas por el usuario apuntan a sesiones distintas de la global.
+#[cfg(any(test, target_os = "macos"))]
+fn should_fallback_keychain(credentials_path: Option<&str>) -> bool {
+    credentials_path.map(str::trim).filter(|s| !s.is_empty()).is_none()
+}
+
+/// Lanzamiento y espera acotada del proceso `security`. Corre en hilo propio
+/// (vía `spawn_blocking`); en timeout mata el proceso y reporta `TimedOut`.
+#[cfg(target_os = "macos")]
+fn keychain_sync(timeout: std::time::Duration) -> KeychainOutcome {
+    use std::process::{Command, Stdio};
+    let child = match Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return KeychainOutcome::NoSession,
+    };
+    match wait_bounded(child, timeout) {
+        Some(output) => match parse_keychain_secret(&output.stdout) {
+            Some(c) => KeychainOutcome::Session(c),
+            None => KeychainOutcome::NoSession,
+        },
+        None => KeychainOutcome::TimedOut,
+    }
+}
+
+/// Espera acotada de un hijo con stdout capturado: devuelve la salida si
+/// terminó bien dentro del presupuesto; en timeout mata el árbol y devuelve
+/// None; en salida fallida devuelve None. Puro respecto del Keychain para
+/// poder probarlo con procesos reales (`sleep`, `true`).
+#[cfg(any(test, target_os = "macos"))]
+fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) -> Option<BoundedOutput> {
+    use std::io::Read;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let stdout = reader.join().unwrap_or_default();
+                return Some(BoundedOutput { success: true, stdout });
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Salida capturada de un proceso que terminó con éxito dentro del presupuesto.
+#[cfg(any(test, target_os = "macos"))]
+struct BoundedOutput {
+    #[allow(dead_code)]
+    success: bool,
+    stdout: String,
 }
 
 /// Parser puro del secreto devuelto por `security … -w`: JSON con la misma
@@ -58,16 +150,31 @@ pub async fn fetch(cfg: &SubscriptionConfig, who: Who<'_>, http: &reqwest::Clien
             Err(e) => return report.fail(Status::Error, e),
         },
         // El archivo no existe: en macOS Claude Code guarda la sesión OAuth en
-        // el Keychain, no en ~/.claude. Se intenta el Keychain antes de fallar.
-        Err(e) => match keychain_fallback() {
-            Some(c) => c,
-            None => {
+        // el Keychain, no en ~/.claude. El respaldo es solo de la sesión
+        // principal sin ruta explícita (ver `should_fallback_keychain`).
+        Err(e) => {
+            if !should_fallback_keychain(cfg.credentials_path.as_deref()) {
                 return report.fail(
                     Status::NeedsLogin,
                     format!("{e}. Inicia sesión en Claude Code."),
-                )
+                );
             }
-        },
+            match keychain_fallback().await {
+                KeychainOutcome::Session(c) => c,
+                KeychainOutcome::TimedOut => {
+                    return report.fail(
+                        Status::Warning,
+                        "La autorización del Keychain no se completó a tiempo. Concede el acceso a «Claude Code-credentials» y espera al próximo refresco.",
+                    )
+                }
+                KeychainOutcome::NoSession => {
+                    return report.fail(
+                        Status::NeedsLogin,
+                        format!("{e}. Inicia sesión en Claude Code."),
+                    )
+                }
+            }
+        }
     };
 
     let mut report = report;
@@ -232,5 +339,47 @@ mod tests {
         assert!(parse_keychain_secret("").is_none());
         assert!(parse_keychain_secret("no es json").is_none());
         assert!(parse_keychain_secret("{\"otra\":1}").is_none());
+    }
+
+    /// Regresión P1 (revisión #112): el respaldo del Keychain es solo de la
+    /// sesión principal sin ruta explícita. Una cuenta adicional (siempre con
+    /// `credentials_path` de su carpeta) o una ruta configurada por el usuario
+    /// NO deben tocar el secreto global de la principal.
+    #[test]
+    fn keychain_fallback_only_for_main_session_without_explicit_path() {
+        assert!(should_fallback_keychain(None));
+        assert!(should_fallback_keychain(Some("  ")));
+        assert!(!should_fallback_keychain(Some("/cuenta/extra/.credentials.json")));
+        assert!(!should_fallback_keychain(Some(" ~/.claude/.credentials.json ")));
+    }
+
+    /// Regresión P2 (revisión #112): la espera es acotada — un proceso que no
+    /// termina dentro del presupuesto muere y `wait_bounded` devuelve None
+    /// rápido, sin colgar. Solo Unix: `sleep`/`true` no existen en Windows.
+    #[cfg(unix)]
+    #[test]
+    fn wait_bounded_kills_a_hung_process_within_the_budget() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let start = std::time::Instant::now();
+        let hung = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("sleep disponible");
+        assert!(wait_bounded(hung, Duration::from_millis(150)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(3), "la espera colgada se mata acotada");
+
+        let quick = Command::new("true")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("true disponible");
+        let out = wait_bounded(quick, Duration::from_secs(5)).expect("proceso rápido termina");
+        assert!(out.stdout.is_empty());
     }
 }

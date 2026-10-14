@@ -240,8 +240,11 @@ fn spawn_terminal(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) ->
 ///
 /// El comando de login es configurable por el usuario: los caracteres de
 /// control se rechazan (un `\n` rompe el quoting de `do script` y puede
-/// ejecutar líneas fuera de la intención), y el resto queda inerte por el
-/// doble escaping shell+AppleScript.
+/// ejecutar líneas fuera de la intención); y la integridad del script queda
+/// protegida por el doble escaping shell+AppleScript. Ojo: los metacaracteres
+/// de shell del comando (p. ej. `;`, `$()`) NO quedan inertes — el comando
+/// configurable se ejecuta como código de shell por diseño; el escaping
+/// protege el contenedor AppleScript, no neutraliza el shell.
 ///
 /// Los helpers puros de quoting también compilan en los builds de test de
 /// Windows y Linux: su contracto de escaping es parte de la superficie probada
@@ -463,7 +466,11 @@ mod tests {
     }
 
     /// Entrada hostil pero imprimible (comillas, backticks, $(…), punto y coma):
-    /// no se rechaza, se deja inerte por el doble escaping y no rompe el script.
+    /// el contrato que acredita este test es de la CAPA APPLESCRIPT — el
+    /// payload no rompe el quoting del script y queda en una sola línea. Los
+    /// metacaracteres de shell NO quedan inertes: el comando configurable se
+    /// ejecuta como código de shell por diseño (es lo que el usuario pidió);
+    /// lo único protegido es la integridad del script que lo contiene.
     #[test]
     fn macos_script_keeps_hostile_printable_input_quoted_and_on_one_line() {
         let script = macos_terminal_script("echo 'co\"de'; rm -rf $(x) `y`; ls", None, None).unwrap();
