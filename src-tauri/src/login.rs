@@ -178,6 +178,9 @@ type SessionEnv = Option<(&'static str, std::path::PathBuf)>;
 
 /// Antepone al PATH la carpeta donde se encontró el CLI (si no estaba en el PATH),
 /// incluyendo el PATH fresco del registro para que la terminal nueva lo vea.
+/// Solo la consumen las ramas Windows/Linux: en macOS el PATH viaja dentro del
+/// texto del script de Terminal, no por herencia del entorno.
+#[cfg(any(test, not(target_os = "macos")))]
 fn path_with(extra: Option<PathBuf>) -> Option<std::ffi::OsString> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
     dirs.extend(fresh_path_dirs());
@@ -185,6 +188,7 @@ fn path_with(extra: Option<PathBuf>) -> Option<std::ffi::OsString> {
 }
 
 /// Antepone `extra` a `current` (el PATH actual) sin tocar el entorno real.
+#[cfg(any(test, not(target_os = "macos")))]
 fn path_with_current(extra: Option<PathBuf>, current: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     let dir = extra?;
     let mut all = vec![dir];
@@ -232,7 +236,11 @@ fn spawn_terminal(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) ->
 /// este proceso), así que el PATH extra y las variables de sesión se inyectan
 /// como parte del texto del script. El texto completo se incrusta entre comillas
 /// dobles de AppleScript con el escaping correspondiente.
-#[cfg(target_os = "macos")]
+///
+/// Los helpers puros de quoting también compilan en los builds de test de
+/// Windows y Linux: su contracto de escaping es parte de la superficie probada
+/// del port y las plataformas sin Terminal deben validarlos igual.
+#[cfg(any(test, target_os = "macos"))]
 fn macos_terminal_script(command: &str, env: SessionEnv, extra_dir: Option<PathBuf>) -> String {
     let mut sh = String::new();
     if let Some(dir) = &extra_dir {
@@ -247,13 +255,13 @@ fn macos_terminal_script(command: &str, env: SessionEnv, extra_dir: Option<PathB
 }
 
 /// Escapa un texto para insertarlo entre comillas simples de shell.
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Escapa un texto para insertarlo entre comillas dobles de AppleScript.
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 fn apple_script_quote(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
