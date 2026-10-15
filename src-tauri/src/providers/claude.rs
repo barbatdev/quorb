@@ -58,7 +58,9 @@ async fn keychain_fallback() -> KeychainOutcome {
 /// ¿Corresponde intentar el respaldo de Keychain? Solo la sesión principal
 /// sin `credentials_path` explícito: las cuentas adicionales y las rutas
 /// configuradas por el usuario apuntan a sesiones distintas de la global.
-#[cfg(any(test, target_os = "macos"))]
+/// Sin gate de cfg: `fetch` la llama en todas las plataformas, y un gate
+/// `any(test, macos)` rompería el build de producción en Windows/Linux
+/// (detectado en revisión de #112).
 fn should_fallback_keychain(credentials_path: Option<&str>) -> bool {
     credentials_path.map(str::trim).filter(|s| !s.is_empty()).is_none()
 }
@@ -79,22 +81,41 @@ fn keychain_sync(timeout: std::time::Duration) -> KeychainOutcome {
         Err(_) => return KeychainOutcome::NoSession,
     };
     match wait_bounded(child, timeout) {
-        Some(output) => match parse_keychain_secret(&output.stdout) {
+        WaitOutcome::Success(output) => match parse_keychain_secret(&output.stdout) {
             Some(c) => KeychainOutcome::Session(c),
             None => KeychainOutcome::NoSession,
         },
-        None => KeychainOutcome::TimedOut,
+        // Salida no cero (entrada ausente, acceso denegado): no hay sesión;
+        // NO es un timeout de autorización y no debe reportarse como tal.
+        WaitOutcome::Failed => KeychainOutcome::NoSession,
+        WaitOutcome::TimedOut => KeychainOutcome::TimedOut,
     }
+}
+
+/// Resultado diferenciado de la espera acotada: terminar bien, terminar mal
+/// o agotar el presupuesto. Distintos a propósito — `keychain_sync` reporta
+/// `NoSession` y `TimedOut` de forma distinta (revisión #112).
+#[cfg(any(test, target_os = "macos"))]
+enum WaitOutcome {
+    /// Terminó con éxito dentro del presupuesto.
+    Success(BoundedOutput),
+    /// Terminó con código no cero (o error de wait): no hay sesión.
+    Failed,
+    /// No terminó dentro del presupuesto: proceso muerto.
+    TimedOut,
 }
 
 /// Espera acotada de un hijo con stdout capturado: devuelve la salida si
 /// terminó bien dentro del presupuesto; en timeout mata el árbol y devuelve
-/// None; en salida fallida devuelve None. Puro respecto del Keychain para
-/// poder probarlo con procesos reales (`sleep`, `true`).
+/// `TimedOut`; en salida fallida, `Failed`. Puro respecto del Keychain para
+/// poder probarlo con procesos reales (`sleep`, `true`, `false`).
 #[cfg(any(test, target_os = "macos"))]
-fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) -> Option<BoundedOutput> {
+fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) -> WaitOutcome {
     use std::io::Read;
-    let mut pipe = child.stdout.take()?;
+    let mut pipe = match child.stdout.take() {
+        Some(p) => p,
+        None => return WaitOutcome::Failed,
+    };
     let reader = std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = pipe.read_to_string(&mut buf);
@@ -105,18 +126,18 @@ fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) ->
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 let stdout = reader.join().unwrap_or_default();
-                return Some(BoundedOutput { success: true, stdout });
+                return WaitOutcome::Success(BoundedOutput { stdout });
             }
-            Ok(Some(_)) => return None,
+            Ok(Some(_)) => return WaitOutcome::Failed,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return WaitOutcome::TimedOut;
             }
-            Err(_) => return None,
+            Err(_) => return WaitOutcome::Failed,
         }
     }
 }
@@ -124,8 +145,6 @@ fn wait_bounded(mut child: std::process::Child, timeout: std::time::Duration) ->
 /// Salida capturada de un proceso que terminó con éxito dentro del presupuesto.
 #[cfg(any(test, target_os = "macos"))]
 struct BoundedOutput {
-    #[allow(dead_code)]
-    success: bool,
     stdout: String,
 }
 
@@ -370,7 +389,7 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .expect("sleep disponible");
-        assert!(wait_bounded(hung, Duration::from_millis(150)).is_none());
+        assert!(matches!(wait_bounded(hung, Duration::from_millis(150)), WaitOutcome::TimedOut));
         assert!(start.elapsed() < Duration::from_secs(3), "la espera colgada se mata acotada");
 
         let quick = Command::new("true")
@@ -379,7 +398,20 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .expect("true disponible");
-        let out = wait_bounded(quick, Duration::from_secs(5)).expect("proceso rápido termina");
+        let out = match wait_bounded(quick, Duration::from_secs(5)) {
+            WaitOutcome::Success(o) => o,
+            _ => panic!("un proceso que termina bien es Success"),
+        };
         assert!(out.stdout.is_empty());
+
+        // Salida no cero → Failed (no TimedOut): distinguir "no hay sesión"
+        // de "la autorización se agotó" (revisión #112).
+        let failing = Command::new("false")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("false disponible");
+        assert!(matches!(wait_bounded(failing, Duration::from_secs(5)), WaitOutcome::Failed));
     }
 }
