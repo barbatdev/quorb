@@ -693,14 +693,6 @@ pub fn run() {
             // detalle/overlay quedarían en otro Space distinto al de la tira.
             // Windows/Linux no lo necesitan: no hay Spaces y siempre-encina ya
             // cubre el caso.
-            #[cfg(target_os = "macos")]
-            for label in [WIDGET, DETAIL, OVERLAY] {
-                if let Some(w) = app.get_webview_window(label) {
-                    if let Err(e) = w.set_visible_on_all_workspaces(true) {
-                        eprintln!("No pude marcar «{label}» visible en todos los Spaces: {e}");
-                    }
-                }
-            }
             let history = history::History::load(data_dir.join("history.json"));
 
             // El detalle tiene su propia superficie: abrirlo nunca redimensiona la tira.
@@ -731,6 +723,17 @@ pub fn run() {
                 .visible(false)
                 .build()?;
             let _ = overlay.set_ignore_cursor_events(true);
+
+            // Se aplica tras construir DETAIL y OVERLAY: si corre antes, esos dos
+            // get_webview_window devuelven None y quedan clavados a su Space.
+            #[cfg(target_os = "macos")]
+            for label in [WIDGET, DETAIL, OVERLAY] {
+                if let Some(w) = app.get_webview_window(label) {
+                    if let Err(e) = w.set_visible_on_all_workspaces(true) {
+                        eprintln!("No pude marcar «{label}» visible en todos los Spaces: {e}");
+                    }
+                }
+            }
 
             app.manage(Shortcuts::default());
             app.manage(codex_setup::CodexSetupState::default());
