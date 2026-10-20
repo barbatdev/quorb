@@ -32,6 +32,19 @@ Pruebas sin red ni GUI: `node --test scripts/macos-preview-policy.test.mjs scrip
 El workflow de preview solo se materializa tras aprobar su plan; uploads y readback real requieren ejecución autorizada.
 Estos fundamentos no publican una preview descargable ni una Release, ni acreditan una preview macOS lista.
 
+## Builds firmadas de la comunidad (no oficiales)
+
+Existe una build de la comunidad de macOS ARM64 firmada con Developer ID y notarizada por Apple,
+mantenida por un contribuidor en su fork:
+https://github.com/barbatdev/quorb/releases/tag/v0.7.0-macos-signed.
+Se compila desde el mismo código fuente de upstream (commit `cd94de0`), firma con Developer ID
+Application con hardened runtime y viaja con el ticket de notarización grapado, por lo que abre sin
+la advertencia de Gatekeeper que afecta a las DMG sin firma.
+No es una build oficial del proyecto: no la produce ni la avala este repositorio, se distribuye bajo
+la licencia MIT y quien la instale debe verificar el SHA-256 publicado junto al artefacto. Las
+builds oficiales de macOS continúan según la política descrita en este documento y en
+[code-signing.md](./code-signing.md).
+
 ## Preflight de fuente: CLI preparatoria
 
 `node scripts/macos-preview-preflight.mjs` requiere `GITHUB_REPOSITORY=egdev6/quorb`, `GITHUB_REF=refs/heads/main`,
